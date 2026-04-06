@@ -1,0 +1,154 @@
+# openenv.yaml — QTrack Hospital Queue Optimization Environment
+# OpenEnv Specification v1.0
+
+name: QTrack-HospitalQueue-v1
+version: "1.0.0"
+description: >
+  A real-world hospital queue optimization environment where an AI agent
+  must manage patient flow across 7 departments, detect overloads, reschedule
+  patient tokens, alert staff, and utilize idle resources to minimize wait times.
+
+author: SANTOSH-PRVT04
+repository: https://huggingface.co/spaces/SANTOSH-PRVT04/Q-track-ai-env
+license: MIT
+
+# ── Environment Details ───────────────────────────────────────────────
+environment:
+  type: sequential-decision
+  domain: healthcare
+  real_world_task: true
+  max_steps: 20
+  deterministic: false   # stochastic patient arrivals
+  seed_support: true
+
+# ── Action Space ──────────────────────────────────────────────────────
+action_space:
+  type: dict
+  fields:
+    action_type:
+      type: str
+      enum: [reschedule, alert_staff, open_walkin, noop]
+      description: >
+        reschedule  — Push patient tokens in a dept by delay_mins
+        alert_staff — Call on-call staff for a critical dept
+        open_walkin — Open walk-in slots at an idle dept
+        noop        — Take no action this step
+    dept:
+      type: str
+      description: Target department name
+      enum:
+        - Cardiology
+        - General Medicine
+        - Pediatrics
+        - Orthopedics
+        - Dermatology
+        - Neurology
+        - Radiology
+    delay_mins:
+      type: int
+      range: [5, 60]
+      description: Minutes to delay patient tokens (only for reschedule)
+
+# ── Observation Space ─────────────────────────────────────────────────
+observation_space:
+  type: dict
+  fields:
+    departments:
+      type: list[dict]
+      description: Load state of all 7 departments
+      fields:
+        id:               {type: str}
+        name:             {type: str}
+        doctor_count:     {type: int}
+        avg_consult_time: {type: int,   description: minutes per patient}
+        capacity:         {type: int,   description: doctor_count * 5}
+        active_patients:  {type: int}
+        load_pct:         {type: float, range: [0.0, 100.0]}
+    overloaded_depts:
+      type: list[str]
+      description: Department names currently above 60% capacity
+    idle_depts:
+      type: list[str]
+      description: Departments with 0 patients but available doctors
+    total_patients:
+      type: int
+    avg_wait_minutes:
+      type: float
+    critical_count:
+      type: int
+      description: Number of departments above 80% capacity
+    step_number:
+      type: int
+    timestamp:
+      type: str
+
+# ── Reward Function ───────────────────────────────────────────────────
+reward:
+  range: [0.0, 1.0]
+  type: shaped
+  components:
+    correct_reschedule:
+      value: +0.4
+      condition: reschedule action on dept with load_pct > 60
+    idle_utilization:
+      value: +0.2
+      condition: open_walkin on idle dept with busiest dept > 30%
+    staff_alert:
+      value: +0.3
+      condition: alert_staff on dept with load_pct > 80
+    low_wait_bonus:
+      value: +0.2
+      condition: avg_wait_minutes < 15 after action
+    unaddressed_penalty:
+      value: -0.3
+      condition: per overloaded dept left unaddressed at episode end
+    unnecessary_action:
+      value: -0.1
+      condition: any action on dept that does not need it
+
+# ── Tasks / Agent Graders ─────────────────────────────────────────────
+tasks:
+  - id: task_easy
+    name: Single Overload Response
+    difficulty: easy
+    seed: 1
+    pass_threshold: 0.35
+    description: >
+      One department is overloaded. Agent must detect and reschedule
+      patients within a few steps.
+
+  - id: task_medium
+    name: Multi-Department Balancing
+    difficulty: medium
+    seed: 7
+    pass_threshold: 0.50
+    description: >
+      2–3 departments overloaded, some idle. Agent must reschedule
+      overloaded depts and open walk-ins at idle ones.
+
+  - id: task_hard
+    name: Full Hospital Crisis Management
+    difficulty: hard
+    seed: 13
+    pass_threshold: 0.65
+    description: >
+      4+ departments in crisis. Agent must triage correctly, alert
+      staff for critical depts, use idle resources, and keep avg
+      wait time below 20 minutes.
+
+# ── Baseline Scores (reproducible) ───────────────────────────────────
+baseline:
+  agent: Rule-based (always reschedule most overloaded dept)
+  scores:
+    easy:   ~0.40
+    medium: ~0.52
+    hard:   ~0.38
+  overall: ~0.45
+
+# ── Setup ─────────────────────────────────────────────────────────────
+setup:
+  python: ">=3.10"
+  install: pip install gradio>=4.0.0
+  run_env: python env.py
+  run_grader: python grader.py
+  run_app: python app.py
