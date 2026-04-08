@@ -1,7 +1,7 @@
 # app.py — QTrack AI Environment
-# Runs FastAPI (OpenEnv REST API) + Gradio UI together on port 7860
+# FastAPI (OpenEnv REST API) + Gradio UI — both on port 7860
 
-# ── Patch 1: Fix missing audioop/pyaudioop in Python 3.13 ────────────
+# ── Compatibility patches ─────────────────────────────────────────────
 import sys, types
 if "audioop" not in sys.modules:
     _audioop = types.ModuleType("audioop")
@@ -9,7 +9,6 @@ if "audioop" not in sys.modules:
 if "pyaudioop" not in sys.modules:
     sys.modules["pyaudioop"] = sys.modules["audioop"]
 
-# ── Patch 2: Fix missing HfFolder in newer huggingface_hub ───────────
 import huggingface_hub
 if not hasattr(huggingface_hub, "HfFolder"):
     class _HfFolder:
@@ -21,71 +20,96 @@ if not hasattr(huggingface_hub, "HfFolder"):
         def delete_token(): pass
     huggingface_hub.HfFolder = _HfFolder
 
+# ── Imports ───────────────────────────────────────────────────────────
 import gradio as gr
 import random
+import uvicorn
 from datetime import datetime, timedelta
+from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
-import uvicorn
-import threading
 
 from env import QTrackEnv
 
-# ── FastAPI app (OpenEnv REST API) ────────────────────────────────────
+# ── FastAPI app ───────────────────────────────────────────────────────
 api = FastAPI(title="QTrack OpenEnv API", version="1.0.0")
-api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _env: Optional[QTrackEnv] = None
 
+
 class ResetRequest(BaseModel):
     seed: Optional[int] = None
+
 
 class StepRequest(BaseModel):
     action_type: str = Field(default="noop")
     dept:        str = Field(default="")
     delay_mins:  int = Field(default=15)
 
+
 @api.post("/reset")
-def api_reset(request: ResetRequest = ResetRequest()):
+def api_reset(request: Optional[ResetRequest] = None):
     global _env
-    _env = QTrackEnv(seed=request.seed)
+    seed = request.seed if request else None
+    _env = QTrackEnv(seed=seed)
     obs  = _env.reset()
     return {"observation": obs.__dict__, "status": "reset_ok"}
 
+
 @api.post("/step")
-def api_step(request: StepRequest = StepRequest()):
+def api_step(request: Optional[StepRequest] = None):
     global _env
     if _env is None:
-        _env = QTrackEnv(); _env.reset()
-    result = _env.step({"action_type": request.action_type, "dept": request.dept, "delay_mins": request.delay_mins})
-    return {"observation": result.observation.__dict__, "reward": result.reward, "done": result.done, "info": result.info}
+        _env = QTrackEnv()
+        _env.reset()
+    if request is None:
+        request = StepRequest()
+    action = {
+        "action_type": request.action_type,
+        "dept":        request.dept,
+        "delay_mins":  request.delay_mins,
+    }
+    result = _env.step(action)
+    return {
+        "observation": result.observation.__dict__,
+        "reward":      result.reward,
+        "done":        result.done,
+        "info":        result.info,
+    }
+
 
 @api.get("/state")
 @api.post("/state")
 def api_state():
     global _env
     if _env is None:
-        _env = QTrackEnv(); _env.reset()
+        _env = QTrackEnv()
+        _env.reset()
     return _env.state()
+
 
 @api.get("/health")
 def api_health():
     return {"status": "ok", "env": "QTrack-HospitalQueue-v1"}
 
-@api.get("/")
-def api_root():
-    return {"name": "QTrack Hospital Queue Environment", "version": "1.0.0", "endpoints": ["/reset", "/step", "/state", "/health"]}
 
-# ── Start FastAPI in background thread on port 8000 ──────────────────
-def run_api():
-    uvicorn.run(api, host="0.0.0.0", port=8000, log_level="warning")
+@api.get("/info")
+def api_info():
+    return {
+        "name":      "QTrack Hospital Queue Environment",
+        "version":   "1.0.0",
+        "endpoints": ["/reset", "/step", "/state", "/health"],
+    }
 
-api_thread = threading.Thread(target=run_api, daemon=True)
-api_thread.start()
 
-# ── Simulated Hospital State ──────────────────────────────────────────
+# ── Hospital simulation data ──────────────────────────────────────────
 DEPARTMENTS = [
     {"id": "dept-1", "name": "Cardiology",      "avg_consult_time": 12, "doctor_count": 2},
     {"id": "dept-2", "name": "General Medicine", "avg_consult_time": 8,  "doctor_count": 2},
@@ -106,6 +130,7 @@ DOCTORS = {
     "Radiology":        ["Dr. Patel"],
 }
 
+
 def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
     active_patients = [card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p]
     dept_loads = []
@@ -125,14 +150,14 @@ def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
                 f"{severity_icons[sev]} **{sev.upper()} — {dept['name']} Overloaded**\n\n"
                 f"**{dept['name']}** is at **{dept['load']}%** capacity "
                 f"({dept['active']} patients, {dept['doctor_count']} doctors).\n\n"
-                f"🤖 *Patient slots in {dept['name']} will be pushed by ~{delay_mins} min.*"
+                f"🤖 *Patient slots will be pushed by ~{delay_mins} min.*"
             )
             action = {
                 "dept": dept["name"], "delay_mins": delay_mins,
                 "reason": (
                     f"Your doctor in {dept['name']} currently has too many patients. "
-                    f"To ensure you receive proper care, your appointment has been "
-                    f"rescheduled by {delay_mins} minutes. We apologise for the inconvenience."
+                    f"Your appointment has been rescheduled by {delay_mins} minutes. "
+                    f"We apologise for the inconvenience."
                 ),
             }
             recommendations.append((display, action))
@@ -144,14 +169,13 @@ def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
             display = (
                 f"📊 **MEDIUM — Queue Imbalance in {dept['name']}**\n\n"
                 f"Avg **{per_doctor:.1f} patients/doctor** — queue building up.\n\n"
-                f"🤖 *Scheduled slots extended by ~{delay_mins} min.*"
+                f"🤖 *Slots extended by ~{delay_mins} min.*"
             )
             action = {
                 "dept": dept["name"], "delay_mins": delay_mins,
                 "reason": (
                     f"The queue in {dept['name']} is longer than usual. "
-                    f"Your appointment has been updated by {delay_mins} minutes "
-                    f"so you are not kept waiting unnecessarily."
+                    f"Your appointment has been updated by {delay_mins} minutes."
                 ),
             }
             recommendations.append((display, action))
@@ -163,7 +187,7 @@ def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
                 display = (
                     f"💡 **LOW — Idle Doctors in {dept['name']}**\n\n"
                     f"{dept['doctor_count']} doctor(s) available with 0 patients.\n\n"
-                    f"🤖 *Staff notified to support {busiest['name']} if needed.*"
+                    f"🤖 *Staff notified to support {busiest['name']}.*"
                 )
                 recommendations.append((display, None))
 
@@ -173,8 +197,8 @@ def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
     load_bars = []
     for d in dept_loads:
         filled = round(d["load"] / 5)
-        bar    = "█" * filled + "░" * (20 - filled)
-        color  = "🔴" if d["load"] > 80 else ("🟠" if d["load"] > 60 else ("🟡" if d["load"] > 30 else "🟢"))
+        bar = "█" * filled + "░" * (20 - filled)
+        color = "🔴" if d["load"] > 80 else ("🟠" if d["load"] > 60 else ("🟡" if d["load"] > 30 else "🟢"))
         load_bars.append(f"{color} {d['name']:<20} [{bar}] {d['load']:>3}%  ({d['active']} pts)")
 
     load_summary = "### 📊 Department Load\n```\n" + "\n".join(load_bars) + "\n```"
@@ -184,7 +208,7 @@ def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
         if total_patients > 0 else 0
     )
     critical_count = sum(1 for d in dept_loads if d["load"] > 80)
-    action_count   = len([r for r in recommendations if r[1] is not None])
+    action_count = len([r for r in recommendations if r[1] is not None])
     stats = (
         f"🧑‍⚕️ **Total Active Patients:** {total_patients} &nbsp;|&nbsp; "
         f"⏱ **Avg Est. Wait:** {avg_wait:.1f} min &nbsp;|&nbsp; "
@@ -193,50 +217,54 @@ def run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
     )
     return load_summary, stats, recommendations
 
+
 def random_scenario():
     return [random.randint(0, 10) for _ in range(7)]
+
 
 def generate_token(dept_name):
     now = datetime.now()
     minutes = (now.minute // 15 + 1) * 15
     base_time = now.replace(second=0, microsecond=0) + timedelta(minutes=(minutes - now.minute))
     token_num = random.randint(100, 999)
-    doctor    = random.choice(DOCTORS.get(dept_name, ["Dr. Unknown"]))
+    doctor = random.choice(DOCTORS.get(dept_name, ["Dr. Unknown"]))
     return {
         "token": f"TKN-{token_num}", "dept": dept_name, "doctor": doctor,
         "orig_time": base_time, "curr_time": base_time,
         "updated": False, "update_reason": None,
     }
 
+
 def format_token_card(token_data, updated=False):
     t = token_data
     orig_str = t["orig_time"].strftime("%I:%M %p")
     curr_str = t["curr_time"].strftime("%I:%M %p")
     if updated:
-        badge     = "🔴 UPDATED"
+        badge = "🔴 UPDATED"
         time_line = f"~~{orig_str}~~ &nbsp;→&nbsp; **{curr_str}** ⏰"
     else:
-        badge     = "🟢 CONFIRMED"
+        badge = "🟢 CONFIRMED"
         time_line = f"**{curr_str}**"
     card = (
         f"### 🎟️ Your Token\n\n"
         f"| | |\n|---|---|\n"
-        f"| **Token No.**   | `{t['token']}` |\n"
-        f"| **Department**  | {t['dept']} |\n"
-        f"| **Doctor**      | {t['doctor']} |\n"
-        f"| **Status**      | {badge} |\n"
-        f"| **Your Slot**   | {time_line} |\n"
+        f"| **Token No.**  | `{t['token']}` |\n"
+        f"| **Department** | {t['dept']} |\n"
+        f"| **Doctor**     | {t['doctor']} |\n"
+        f"| **Status**     | {badge} |\n"
+        f"| **Your Slot**  | {time_line} |\n"
     )
     if updated and t["update_reason"]:
         card += f"\n\n> 📢 **Notice:** {t['update_reason']}"
     return card
 
+
 def get_token(dept_name):
     if not dept_name:
         return gr.update(visible=False), None, ""
     token_data = generate_token(dept_name)
-    card = format_token_card(token_data)
-    return gr.update(visible=True), token_data, card
+    return gr.update(visible=True), token_data, format_token_card(token_data)
+
 
 def apply_action(action_dict, token_data):
     if token_data is None:
@@ -247,22 +275,21 @@ def apply_action(action_dict, token_data):
     if token_data["dept"] != action_dict["dept"]:
         return token_data, current_card, (
             f"ℹ️ This alert is for **{action_dict['dept']}**. "
-            f"Your appointment is with **{token_data['dept']}** — your schedule is unchanged. ✅"
+            f"Your appointment is with **{token_data['dept']}** — schedule unchanged. ✅"
         )
-    delay = action_dict["delay_mins"]
-    token_data["curr_time"]     = token_data["curr_time"] + timedelta(minutes=delay)
-    token_data["updated"]       = True
+    token_data["curr_time"]    = token_data["curr_time"] + timedelta(minutes=action_dict["delay_mins"])
+    token_data["updated"]      = True
     token_data["update_reason"] = action_dict["reason"]
     new_card = format_token_card(token_data, updated=True)
-    msg = f"✅ Schedule updated! Your new slot: **{token_data['curr_time'].strftime('%I:%M %p')}**"
-    return token_data, new_card, msg
+    return token_data, new_card, f"✅ Schedule updated! New slot: **{token_data['curr_time'].strftime('%I:%M %p')}**"
+
 
 # ── Gradio UI ─────────────────────────────────────────────────────────
 with gr.Blocks(
     title="QTrack AI Environment | XYZ Hospital",
     theme=gr.themes.Soft(),
     css=".gradio-container { max-width: 1300px !important; } footer { display: none !important; }",
-) as demo:
+) as gradio_app:
 
     token_state = gr.State(None)
 
@@ -276,7 +303,10 @@ with gr.Blocks(
 
     gr.Markdown("---\n### 🎟️ Step 1: Generate Your Token")
     with gr.Row():
-        dept_dropdown = gr.Dropdown(choices=[d["name"] for d in DEPARTMENTS], label="Select Your Department", value="Cardiology")
+        dept_dropdown = gr.Dropdown(
+            choices=[d["name"] for d in DEPARTMENTS],
+            label="Select Your Department", value="Cardiology"
+        )
         get_token_btn = gr.Button("🎟️ Get Token", variant="primary", size="lg")
 
     with gr.Group(visible=False) as token_card_group:
@@ -328,14 +358,19 @@ with gr.Blocks(
     | Different dept alert | No change — your schedule is untouched ✅ |
 
     *You always stay with your same doctor & department. Only the time is adjusted.*
-
     *Built for the OpenEnv Hackathon · QTrack by XYZ Hospital Team*
     """)
 
-    get_token_btn.click(fn=get_token, inputs=[dept_dropdown], outputs=[token_card_group, token_state, token_card_out])
+    get_token_btn.click(
+        fn=get_token,
+        inputs=[dept_dropdown],
+        outputs=[token_card_group, token_state, token_card_out]
+    )
 
     def update_ui(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p):
-        load_summary, stats, recommendations = run_ai_engine(card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p)
+        load_summary, stats, recommendations = run_ai_engine(
+            card_p, gen_p, peds_p, ortho_p, derm_p, neuro_p, radio_p
+        )
         out = [load_summary, stats]
         for i in range(MAX_RECS):
             if i < len(recommendations):
@@ -349,11 +384,19 @@ with gr.Blocks(
     for i in range(MAX_RECS):
         all_outputs += [groups[i], rec_mds[i], act_dicts[i], act_msgs[i]]
 
-    run_btn.click(fn=update_ui, inputs=[card, gen, peds, ortho, derm, neuro, radio], outputs=all_outputs)
-    random_btn.click(fn=random_scenario, inputs=[], outputs=[card, gen, peds, ortho, derm, neuro, radio])
-
+    run_btn.click(fn=update_ui,
+                  inputs=[card, gen, peds, ortho, derm, neuro, radio],
+                  outputs=all_outputs)
+    random_btn.click(fn=random_scenario, inputs=[],
+                     outputs=[card, gen, peds, ortho, derm, neuro, radio])
     for i in range(MAX_RECS):
-        act_btns[i].click(fn=apply_action, inputs=[act_dicts[i], token_state], outputs=[token_state, token_card_out, act_msgs[i]])
+        act_btns[i].click(fn=apply_action,
+                          inputs=[act_dicts[i], token_state],
+                          outputs=[token_state, token_card_out, act_msgs[i]])
 
-# ── Launch Gradio on port 7860 ────────────────────────────────────────
-demo.launch(server_name="0.0.0.0", server_port=7860)
+
+# ── Mount Gradio into FastAPI and serve everything on port 7860 ───────
+app = gr.mount_gradio_app(api, gradio_app, path="/")
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=7860)
